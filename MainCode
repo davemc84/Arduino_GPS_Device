@@ -1,0 +1,332 @@
+// Code is almost entirely from Adafruit examples
+// Please support them by shopping at www.adafruit.com
+
+#include <Adafruit_GPS.h>
+#include <SoftwareSerial.h>
+#include <Wire.h>
+#include <Adafruit_HMC5883_U.h>
+#include <Adafruit_Sensor.h>
+#include <Servo.h>
+ 
+Servo myservoDistance;
+Servo myservoDirection;
+
+int lonFirstDigInPin = 2;  // MAY NEED TO BE CHANGED
+int lonInPin = 3;  // MAY NEED TO BE CHANGED
+int latInPin = 4;  // MAY NEED TO BE CHANGED
+int servoDistancePin = 9;  // MAY NEED TO BE CHANGED
+int servoDirectionPin = 10;  // MAY NEED TO BE CHANGED
+
+Adafruit_HMC5883_Unified mag = Adafruit_HMC5883_Unified(12345);
+
+Adafruit_GPS GPS(&Serial1);
+
+#define GPSECHO false
+
+boolean usingInterrupt = false;
+void useInterrupt(boolean);
+
+void setup()  
+{
+  if(!mag.begin())
+  {
+    /* There was a problem detecting the HMC5883 ... check your connections */
+    Serial.println("Ooops, no HMC5883 detected ... Check your wiring!");
+    while(1);
+  }
+
+  sensor_t sensor;
+  mag.getSensor(&sensor);
+
+  Serial.begin(115200);
+  delay(5000);
+  
+  Serial.println("Initialize");
+
+  Wire.begin();
+  GPS.begin(9600);
+  GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
+  GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
+  GPS.sendCommand(PGCMD_ANTENNA);
+
+  useInterrupt(true);
+
+  delay(1000);
+
+  myservoDistance.attach(servoDistancePin);
+  myservoDirection.attach(servoDirectionPin);
+
+  pinMode(lonFirstDigInPin, INPUT);
+  pinMode(lonInPin, INPUT);
+  pinMode(latInPin, INPUT);
+}
+
+SIGNAL(TIMER0_COMPA_vect) {
+  char c = GPS.read();
+#ifdef UDR0
+  if (GPSECHO)
+    if (c) UDR0 = c;  
+#endif
+}
+
+void useInterrupt(boolean v) {
+  if (v) {
+    OCR0A = 0xAF;
+    TIMSK0 |= _BV(OCIE0A);
+    usingInterrupt = true;
+  } else {
+    TIMSK0 &= ~_BV(OCIE0A);
+    usingInterrupt = false;
+  }
+}
+
+uint32_t timer = millis();
+
+void loop()
+{
+  sensors_event_t event; 
+  mag.getEvent(&event);
+
+  if (! usingInterrupt) {
+    char c = GPS.read();
+    if (GPSECHO)
+        if (c) Serial.print(c);
+  }
+  
+  if (GPS.newNMEAreceived()) {
+    if (!GPS.parse(GPS.lastNMEA()))
+      return;
+  }
+  
+  // if millis() or timer wraps around, we'll just reset it
+  if (timer > millis())  timer = millis();
+
+  // every seconds, update the heading/distance indicators
+  if (millis() - timer > 2000) { 
+    timer = millis(); // reset the timer
+    
+    Serial.print("\nTime: ");
+    Serial.print(GPS.hour, DEC); Serial.print(':');
+    Serial.print(GPS.minute, DEC); Serial.print(':');
+    Serial.print(GPS.seconds, DEC); Serial.print('.');
+    Serial.println(GPS.milliseconds);
+    Serial.print("Date: ");
+    Serial.print(GPS.day, DEC); Serial.print('/');
+    Serial.print(GPS.month, DEC); Serial.print("/20");
+    Serial.println(GPS.year, DEC);
+    Serial.print("Fix: "); Serial.print((int)GPS.fix);
+    Serial.print(" quality: "); Serial.println((int)GPS.fixquality); 
+
+    if (GPS.fix) {
+      Serial.print("GPS FIX");
+      Serial.print("Location: ");
+      Serial.print(GPS.latitude, 2); Serial.print(GPS.lat);
+      Serial.print(", "); 
+      Serial.print(GPS.longitude, 2); Serial.println(GPS.lon);
+      
+      float fLat = decimalDegrees(GPS.latitude, GPS.lat);
+      float fLon = decimalDegrees(GPS.longitude, GPS.lon);
+      
+//      float targetLat = 50.943750; //DUMMY FOR DEBUGGING
+//      float targetLon = -86.162516; //DUMMY FOR DEBUGGING
+   
+      long tempMechDec = readMechDec(0);
+      tempMechDec = min(tempMechDec, 900000);
+      float targetLat = tempMechDec / 10000.0000;
+      
+      tempMechDec = readMechDec(6);
+      tempMechDec = min(tempMechDec, 1800000);
+      float targetLon = tempMechDec / 10000.0000;
+      
+      if(digitalRead(lonFirstDigInPin)){
+        targetLon+=100;
+      }
+      
+      if(digitalRead(latInPin)) {
+        targetLat*=-1;
+      }
+      
+      targetLat*=-1;
+      
+      if(digitalRead(lonInPin)) {
+        targetLon*=-1;
+      }
+      
+      targetLon*=-1;
+
+      Serial.print("Entered Latitude: "); Serial.println(targetLat, 4);
+      Serial.print("Entered Longitude: "); Serial.println(targetLon, 4);
+
+      float heading = atan2(event.magnetic.y, event.magnetic.x);
+      // Correct for when signs are reversed.
+      if(heading < 0)
+        heading += 2*PI;
+    
+      // Check for wrap due to addition of declination.
+      if(heading > 2*PI)
+        heading -= 2*PI;
+   
+      // Convert radians to degrees for readability.
+      float headingDegrees = heading * 180/M_PI; 
+      int headingDirection = 0;
+      long headingDistance = 0;
+
+      if ((calc_bearing(fLat, fLon, targetLat, targetLon) - headingDegrees) > 0) {
+        headingDirection = calc_bearing(fLat, fLon, targetLat, targetLon)-headingDegrees;
+       }
+      else {
+        headingDirection = calc_bearing(fLat, fLon, targetLat, targetLon)-headingDegrees+360;
+      }
+      
+      headingDistance = (double)calc_dist(fLat, fLon, targetLat, targetLon);
+      
+      moveServos(headingDirection, headingDistance);
+
+      Serial.print("Heading: "); Serial.println(headingDegrees);
+      Serial.print("Distance Remaining: "); Serial.println(headingDistance);
+
+    }
+  }
+}
+
+int calc_bearing(float flat1, float flon1, float flat2, float flon2)
+{
+  float calc;
+  float bear_calc;
+
+  float x = 69.1 * (flat2 - flat1); 
+  float y = 69.1 * (flon2 - flon1) * cos(flat1/57.3);
+
+  calc=atan2(y,x);
+
+  bear_calc= degrees(calc);
+
+  if(bear_calc<=1){
+    bear_calc=360+bear_calc; 
+  }
+  return bear_calc;
+}
+
+unsigned long calc_dist(float flat1, float flon1, float flat2, float flon2)
+{
+  float dist_calc=0;
+  float dist_calc2=0;
+  float diflat=0;
+  float diflon=0;
+
+  diflat=radians(flat2-flat1);
+  flat1=radians(flat1);
+  flat2=radians(flat2);
+  diflon=radians((flon2)-(flon1));
+
+  dist_calc = (sin(diflat/2.0)*sin(diflat/2.0));
+  dist_calc2= cos(flat1);
+  dist_calc2*=cos(flat2);
+  dist_calc2*=sin(diflon/2.0);
+  dist_calc2*=sin(diflon/2.0);
+  dist_calc +=dist_calc2;
+
+  dist_calc=(2*atan2(sqrt(dist_calc),sqrt(1.0-dist_calc)));
+
+  dist_calc*=20902231; //Converting to feet
+  return dist_calc;
+}
+
+// Convert NMEA coordinate to decimal degrees
+float decimalDegrees(float nmeaCoord, char dir)
+{
+  uint16_t wholeDegrees = 0.01*nmeaCoord;
+  int modifier = 1;
+
+  if (dir == 'W' || dir == 'S') {
+    modifier = -1;
+  }
+  
+  return (wholeDegrees + (nmeaCoord - 100.0*wholeDegrees)/60.0) * modifier;
+}
+
+// Read latitude and longitude
+long readMechDec(int startVal)
+{
+  int newDigit = 0;
+  long latOrLon = 0;
+  int endVal = startVal + 6;  
+  
+  for (int thisPin = startVal; thisPin < endVal; thisPin++) { 
+    
+    int pinVal = analogRead(thisPin);
+
+    if (pinVal < 106) {
+      newDigit = 0;
+    }
+    
+    if ((pinVal >= 106)&&(pinVal < 118)) {
+      newDigit = 1;
+    }
+    
+     if ((pinVal >= 118)&&(pinVal < 134)) {
+      newDigit = 2;
+    }
+    
+    if ((pinVal >= 134)&&(pinVal < 155)) {
+      newDigit = 3;
+    }
+    
+    if ((pinVal >= 155)&&(pinVal < 180)) {
+      newDigit = 4;
+    }
+    
+    if ((pinVal >= 180)&&(pinVal < 220)) {
+      newDigit = 5;
+    }
+    
+    if ((pinVal >= 220)&&(pinVal < 300)) {
+      newDigit = 6;
+    }
+    
+    if ((pinVal >= 300)&&(pinVal < 400)) {
+      newDigit = 7;
+    }
+    
+    if ((pinVal >= 400)&&(pinVal < 800)) {
+      newDigit = 8;
+    }
+    
+    if (pinVal >= 800) {
+      newDigit = 9;
+    }
+
+    long newDigitAdd = round(newDigit * pow(10, (thisPin - startVal)));
+
+    latOrLon = latOrLon + newDigitAdd;
+
+  }
+
+  return latOrLon;
+}
+
+// Move the servos
+void moveServos(int heading, long distance)
+{
+  int headingServoPos = 0;
+  int distanceServoPos = 0;
+
+  if (heading < 180) {
+    headingServoPos = map(heading, 0, 90, 90, 0); //FIRST 90 WAS 179 PREVIOUSLY
+  } else {
+    headingServoPos = map(heading, 270, 360, 180, 90); //270 WAS 180 PREVIOUSLY
+  }
+
+  distanceServoPos = map(log10(min(max(distance, 1),26400000)), 0, 7.4216, 0, 180);
+
+  Serial.println(log10(distance));
+
+  Serial.println(headingServoPos);
+  Serial.println(distanceServoPos);
+
+  myservoDirection.write(headingServoPos);
+  delay(500);
+
+  myservoDistance.write(distanceServoPos);
+  delay(500);
+}
